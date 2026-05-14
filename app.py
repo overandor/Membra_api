@@ -1,225 +1,214 @@
+"""MEMBRA API — canonical gateway for the proof-of-reality network.
+
+This service normalizes the shared objects used by the MEMBRA repos:
+users, assets, listings, campaigns, relay jobs, proof events, wallet ledger
+entries, and payout eligibility records.
+
+It is intentionally settlement-safe: it records eligibility and audit state,
+but it does not move money by itself.
+"""
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import os
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-APP_NAME = os.getenv('APP_NAME', 'Membra API')
-APP_VERSION = '0.1.0'
-DB_PATH = Path(os.getenv('APP_DB_PATH', 'membra_api.db'))
-QR_BASE_URL = os.getenv('QR_BASE_URL', 'http://localhost:8000/r')
-NFC_BASE_URL = os.getenv('NFC_BASE_URL', 'http://localhost:8000/n')
-PROOF_REVIEW_REQUIRED = os.getenv('PROOF_REVIEW_REQUIRED', 'true').lower() == 'true'
-ALLOW_REWARD_RELEASE = os.getenv('ALLOW_REWARD_RELEASE', 'false').lower() == 'true'
-
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+APP_NAME = "MEMBRA API Gateway"
+APP_VERSION = "1.0.0"
+DB_PATH = Path(os.getenv("APP_DB_PATH", "/tmp/membra_api.sqlite3"))
+api = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 
-def now_iso() -> str:
+def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def new_id(prefix: str) -> str:
-    return f'{prefix}_{uuid.uuid4().hex[:16]}'
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def digest(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def init_db() -> None:
     with db() as conn:
-        conn.executescript('''
-        CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, email TEXT, display_name TEXT, status TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS advertisers (id TEXT PRIMARY KEY, email TEXT, company_name TEXT, status TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, owner_id TEXT, asset_type TEXT, title TEXT, city TEXT, status TEXT, verification_status TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, advertiser_id TEXT, title TEXT, destination_url TEXT, budget_cents INTEGER, status TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS media_kits (id TEXT PRIMARY KEY, campaign_id TEXT, asset_id TEXT, kit_type TEXT, qr_id TEXT, nfc_id TEXT, status TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS proof_events (id TEXT PRIMARY KEY, campaign_id TEXT, owner_id TEXT, asset_id TEXT, media_kit_id TEXT, proof_type TEXT, evidence_url TEXT, status TEXT, review_notes TEXT, created_at TEXT, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS tracking_events (id TEXT PRIMARY KEY, campaign_id TEXT, qr_id TEXT, nfc_id TEXT, event_type TEXT, created_at TEXT);
-        CREATE TABLE IF NOT EXISTS reward_states (id TEXT PRIMARY KEY, campaign_id TEXT, owner_id TEXT, proof_event_id TEXT, status TEXT, amount_cents INTEGER, created_at TEXT, updated_at TEXT);
-        CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, actor_id TEXT, event_type TEXT, metadata TEXT, created_at TEXT);
-        ''')
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users(user_id TEXT PRIMARY KEY,email TEXT,display_name TEXT,role TEXT,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS assets(asset_id TEXT PRIMARY KEY,owner_id TEXT,asset_type TEXT,title TEXT,location_scope TEXT,consent_scope TEXT,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS listings(listing_id TEXT PRIMARY KEY,asset_id TEXT,listing_type TEXT,price_usd REAL,availability TEXT,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS campaigns(campaign_id TEXT PRIMARY KEY,advertiser_id TEXT,title TEXT,budget_usd REAL,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS relay_jobs(relay_id TEXT PRIMARY KEY,requester_id TEXT,pickup_node TEXT,dropoff_node TEXT,mode TEXT,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS proof_events(proof_id TEXT PRIMARY KEY,subject_type TEXT,subject_id TEXT,proof_type TEXT,evidence_url TEXT,metadata_json TEXT,proof_hash TEXT,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS wallet_events(ledger_event_id TEXT PRIMARY KEY,user_id TEXT,subject_type TEXT,subject_id TEXT,amount_usd REAL,event_type TEXT,status TEXT,metadata_json TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS payout_eligibility(payout_event_id TEXT PRIMARY KEY,user_id TEXT,subject_type TEXT,subject_id TEXT,eligible_amount_usd REAL,eligibility_reason TEXT,status TEXT,created_at TEXT);
+        """)
+
+init_db()
 
 
-@app.on_event('startup')
-def startup() -> None:
-    init_db()
+class UserIn(BaseModel):
+    email: str
+    display_name: str = "MEMBRA User"
+    role: str = "owner"
 
 
-class OwnerCreate(BaseModel):
-    email: Optional[str] = None
-    display_name: str = 'Membra Owner'
-
-
-class AdvertiserCreate(BaseModel):
-    email: Optional[str] = None
-    company_name: str = 'Membra Advertiser'
-
-
-class AssetCreate(BaseModel):
+class AssetIn(BaseModel):
     owner_id: str
     asset_type: str
     title: str
-    city: Optional[str] = None
+    location_scope: str = "local"
+    consent_scope: str = "permissioned listing and proof metadata only"
 
 
-class CampaignCreate(BaseModel):
+class ListingIn(BaseModel):
+    asset_id: str
+    listing_type: str = "access"
+    price_usd: float = Field(default=0, ge=0)
+    availability: str = "manual approval required"
+
+
+class CampaignIn(BaseModel):
     advertiser_id: str
     title: str
-    destination_url: str
-    budget_cents: int = 0
+    budget_usd: float = Field(default=0, ge=0)
 
 
-class MediaKitCreate(BaseModel):
-    campaign_id: str
-    asset_id: Optional[str] = None
-    kit_type: str = 'qr_sticker'
+class RelayIn(BaseModel):
+    requester_id: str
+    pickup_node: str
+    dropoff_node: str
+    mode: str = "local_delivery"
 
 
-class ProofCreate(BaseModel):
-    campaign_id: str
-    owner_id: Optional[str] = None
-    asset_id: Optional[str] = None
-    media_kit_id: Optional[str] = None
-    proof_type: str = 'install_photo'
-    evidence_url: Optional[str] = None
+class ProofIn(BaseModel):
+    subject_type: str
+    subject_id: str
+    proof_type: str = "photo_timestamp_metadata"
+    evidence_url: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ProofReview(BaseModel):
-    status: str = Field(..., description='approved, rejected, disputed')
-    review_notes: Optional[str] = None
+class WalletEventIn(BaseModel):
+    user_id: str
+    subject_type: str
+    subject_id: str
+    amount_usd: float = 0
+    event_type: str = "payout_hold"
+    status: str = "recorded_not_settled"
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-@app.get('/v1/health')
+@api.get("/api/health")
 def health() -> dict[str, Any]:
-    return {'ok': True, 'app': APP_NAME, 'version': APP_VERSION, 'reward_release_enabled': ALLOW_REWARD_RELEASE}
+    return {"ok": True, "app": APP_NAME, "version": APP_VERSION, "doctrine": "proof records eligibility; external rails settle money"}
 
 
-@app.post('/v1/owners')
-def create_owner(payload: OwnerCreate) -> dict[str, Any]:
-    oid = new_id('owner')
-    ts = now_iso()
+@api.post("/api/users")
+def create_user(data: UserIn) -> dict[str, Any]:
+    user_id = new_id("usr")
+    row = {"user_id": user_id, "email": data.email, "display_name": data.display_name, "role": data.role, "status": "active", "created_at": now()}
     with db() as conn:
-        conn.execute('INSERT INTO owners VALUES (?, ?, ?, ?, ?, ?)', (oid, payload.email, payload.display_name, 'active', ts, ts))
-    return {'owner_id': oid, 'status': 'active'}
+        conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.post('/v1/advertisers')
-def create_advertiser(payload: AdvertiserCreate) -> dict[str, Any]:
-    aid = new_id('adv')
-    ts = now_iso()
+@api.post("/api/assets")
+def create_asset(data: AssetIn) -> dict[str, Any]:
+    asset_id = new_id("asset")
+    row = {"asset_id": asset_id, "owner_id": data.owner_id, "asset_type": data.asset_type, "title": data.title, "location_scope": data.location_scope, "consent_scope": data.consent_scope, "status": "registered_pending_verification", "created_at": now()}
     with db() as conn:
-        conn.execute('INSERT INTO advertisers VALUES (?, ?, ?, ?, ?, ?)', (aid, payload.email, payload.company_name, 'active', ts, ts))
-    return {'advertiser_id': aid, 'status': 'active'}
+        conn.execute("INSERT INTO assets VALUES(?,?,?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.post('/v1/ad-assets')
-def create_asset(payload: AssetCreate) -> dict[str, Any]:
-    asset_id = new_id('asset')
-    ts = now_iso()
+@api.post("/api/listings")
+def create_listing(data: ListingIn) -> dict[str, Any]:
+    listing_id = new_id("lst")
+    row = {"listing_id": listing_id, "asset_id": data.asset_id, "listing_type": data.listing_type, "price_usd": data.price_usd, "availability": data.availability, "status": "draft_permission_required", "created_at": now()}
     with db() as conn:
-        conn.execute('INSERT INTO assets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (asset_id, payload.owner_id, payload.asset_type, payload.title, payload.city, 'pending', 'unverified', ts, ts))
-    return {'asset_id': asset_id, 'status': 'pending'}
+        conn.execute("INSERT INTO listings VALUES(?,?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.post('/v1/ad-assets/{asset_id}/verify')
-def verify_asset(asset_id: str) -> dict[str, Any]:
+@api.post("/api/campaigns")
+def create_campaign(data: CampaignIn) -> dict[str, Any]:
+    campaign_id = new_id("cmp")
+    row = {"campaign_id": campaign_id, "advertiser_id": data.advertiser_id, "title": data.title, "budget_usd": data.budget_usd, "status": "draft_pending_funding_and_approval", "created_at": now()}
     with db() as conn:
-        if not conn.execute('SELECT id FROM assets WHERE id=?', (asset_id,)).fetchone():
-            raise HTTPException(404, 'asset not found')
-        conn.execute('UPDATE assets SET status=?, verification_status=?, updated_at=? WHERE id=?', ('available', 'verified', now_iso(), asset_id))
-    return {'asset_id': asset_id, 'status': 'available', 'verification_status': 'verified'}
+        conn.execute("INSERT INTO campaigns VALUES(?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.post('/v1/campaigns')
-def create_campaign(payload: CampaignCreate) -> dict[str, Any]:
-    campaign_id = new_id('camp')
-    ts = now_iso()
+@api.post("/api/relay-jobs")
+def create_relay_job(data: RelayIn) -> dict[str, Any]:
+    relay_id = new_id("relay")
+    row = {"relay_id": relay_id, "requester_id": data.requester_id, "pickup_node": data.pickup_node, "dropoff_node": data.dropoff_node, "mode": data.mode, "status": "draft_pending_agent_acceptance", "created_at": now()}
     with db() as conn:
-        conn.execute('INSERT INTO campaigns VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (campaign_id, payload.advertiser_id, payload.title, payload.destination_url, payload.budget_cents, 'draft', ts, ts))
-    return {'campaign_id': campaign_id, 'status': 'draft'}
+        conn.execute("INSERT INTO relay_jobs VALUES(?,?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.post('/v1/campaigns/{campaign_id}/fund')
-def fund_campaign(campaign_id: str) -> dict[str, Any]:
+@api.post("/api/proofs")
+def create_proof(data: ProofIn) -> dict[str, Any]:
+    proof_id = new_id("proof")
+    payload = data.model_dump()
+    proof_hash = digest(payload)
+    row = {"proof_id": proof_id, "subject_type": data.subject_type, "subject_id": data.subject_id, "proof_type": data.proof_type, "evidence_url": data.evidence_url, "metadata_json": json.dumps(data.metadata, default=str), "proof_hash": proof_hash, "status": "submitted_pending_review", "created_at": now()}
     with db() as conn:
-        if not conn.execute('SELECT id FROM campaigns WHERE id=?', (campaign_id,)).fetchone():
-            raise HTTPException(404, 'campaign not found')
-        conn.execute('UPDATE campaigns SET status=?, updated_at=? WHERE id=?', ('funded', now_iso(), campaign_id))
-    return {'campaign_id': campaign_id, 'status': 'funded'}
+        conn.execute("INSERT INTO proof_events VALUES(?,?,?,?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.post('/v1/media-kits')
-def create_media_kit(payload: MediaKitCreate) -> dict[str, Any]:
-    kit_id = new_id('kit')
-    qr_id = new_id('qr')
-    nfc_id = new_id('nfc') if 'nfc' in payload.kit_type.lower() else None
-    ts = now_iso()
+@api.post("/api/wallet-events")
+def create_wallet_event(data: WalletEventIn) -> dict[str, Any]:
+    ledger_event_id = new_id("ledger")
+    row = {"ledger_event_id": ledger_event_id, "user_id": data.user_id, "subject_type": data.subject_type, "subject_id": data.subject_id, "amount_usd": data.amount_usd, "event_type": data.event_type, "status": data.status, "metadata_json": json.dumps(data.metadata, default=str), "created_at": now()}
     with db() as conn:
-        conn.execute('INSERT INTO media_kits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (kit_id, payload.campaign_id, payload.asset_id, payload.kit_type, qr_id, nfc_id, 'qr_generated', ts, ts))
-    return {'media_kit_id': kit_id, 'qr_id': qr_id, 'nfc_id': nfc_id, 'qr_url': f'{QR_BASE_URL}/{qr_id}'}
+        conn.execute("INSERT INTO wallet_events VALUES(?,?,?,?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.post('/v1/proof-events')
-def create_proof(payload: ProofCreate) -> dict[str, Any]:
-    proof_id = new_id('proof')
-    status = 'submitted' if PROOF_REVIEW_REQUIRED else 'approved'
-    ts = now_iso()
+@api.post("/api/payout-eligibility/from-proof/{proof_id}")
+def create_payout_eligibility(proof_id: str, user_id: str, amount_usd: float = 0) -> dict[str, Any]:
     with db() as conn:
-        conn.execute('INSERT INTO proof_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (proof_id, payload.campaign_id, payload.owner_id, payload.asset_id, payload.media_kit_id, payload.proof_type, payload.evidence_url, status, None, ts, ts))
-    return {'proof_id': proof_id, 'status': status}
-
-
-@app.post('/v1/proof-events/{proof_id}/review')
-def review_proof(proof_id: str, payload: ProofReview) -> dict[str, Any]:
-    if payload.status not in {'approved', 'rejected', 'disputed'}:
-        raise HTTPException(400, 'invalid status')
+        proof = conn.execute("SELECT * FROM proof_events WHERE proof_id=?", (proof_id,)).fetchone()
+    if not proof:
+        raise HTTPException(404, "proof not found")
+    payout_event_id = new_id("payout")
+    row = {"payout_event_id": payout_event_id, "user_id": user_id, "subject_type": proof["subject_type"], "subject_id": proof["subject_id"], "eligible_amount_usd": amount_usd, "eligibility_reason": f"proof_submitted:{proof_id}", "status": "eligible_pending_external_settlement", "created_at": now()}
     with db() as conn:
-        row = conn.execute('SELECT * FROM proof_events WHERE id=?', (proof_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, 'proof not found')
-        conn.execute('UPDATE proof_events SET status=?, review_notes=?, updated_at=? WHERE id=?', (payload.status, payload.review_notes, now_iso(), proof_id))
-    return {'proof_id': proof_id, 'status': payload.status}
+        conn.execute("INSERT INTO payout_eligibility VALUES(?,?,?,?,?,?,?,?)", tuple(row.values()))
+    return row
 
 
-@app.get('/r/{qr_id}')
-def qr_redirect(qr_id: str) -> RedirectResponse:
+@api.get("/api/{table}")
+def list_table(table: str) -> dict[str, Any]:
+    allowed = {"users", "assets", "listings", "campaigns", "relay_jobs", "proof_events", "wallet_events", "payout_eligibility"}
+    if table not in allowed:
+        raise HTTPException(404, "unknown table")
     with db() as conn:
-        kit = conn.execute('SELECT * FROM media_kits WHERE qr_id=?', (qr_id,)).fetchone()
-        if not kit:
-            raise HTTPException(404, 'QR not found')
-        campaign = conn.execute('SELECT * FROM campaigns WHERE id=?', (kit['campaign_id'],)).fetchone()
-        if not campaign:
-            raise HTTPException(404, 'campaign not found')
-        conn.execute('INSERT INTO tracking_events VALUES (?, ?, ?, ?, ?, ?)', (new_id('track'), campaign['id'], qr_id, None, 'qr_scan', now_iso()))
-    return RedirectResponse(campaign['destination_url'])
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT 250").fetchall()
+    return {table: [dict(r) for r in rows]}
 
 
-@app.get('/v1/campaigns')
-def list_campaigns() -> dict[str, Any]:
-    with db() as conn:
-        rows = conn.execute('SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100').fetchall()
-    return {'campaigns': [dict(row) for row in rows]}
+app = api
 
-
-@app.get('/v1/proof-reports/{campaign_id}')
-def proof_report(campaign_id: str) -> dict[str, Any]:
-    with db() as conn:
-        proofs = conn.execute('SELECT * FROM proof_events WHERE campaign_id=? ORDER BY created_at DESC', (campaign_id,)).fetchall()
-        events = conn.execute('SELECT * FROM tracking_events WHERE campaign_id=? ORDER BY created_at DESC', (campaign_id,)).fetchall()
-    return {'campaign_id': campaign_id, 'proof_events': [dict(r) for r in proofs], 'tracking_events': [dict(r) for r in events]}
-
-
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv('PORT', '8000')))
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))

@@ -1,22 +1,27 @@
 # Membra API
 
-Central MEMBRA control-plane API for owners, advertisers, campaigns, assets, media kits, proof events, QR/NFC tracking, and payout logic.
+**Membra API is the future centralized control-plane API for MEMBRA Labs and the MEMBRA Proof Network.**
 
-## One-line thesis
+It defines the source-of-truth backend contract for owners, advertisers, campaigns, assets, creatives, media kits, QR/NFC tracking, proof events, payout states, and audit records.
 
-Membra API is the source-of-truth backend that turns owners, surfaces, campaigns, kits, scans, proof records, and reward states into one coherent physical media network.
+## Company Context
 
-## Role in the ecosystem
+- Company: **MEMBRA Labs**
+- Flagship product: **MEMBRA Proof Network**
+- Module: **Membra API**
+- Category: central control plane, shared backend contract, proof-commerce source of truth
 
-- `Membra_ads` defines the ad network product wedge.
-- `Membra_api` owns the production backend contract.
-- `membra-qr-gateway` consumes this API for dashboards.
-- `Membra_mobile` consumes this API for owner proof workflows.
-- `Membra_proofbook` verifies records created by this API.
-- `Membra_wallet` coordinates payment and reward state.
-- `Membra_vendor_adapters` handles fulfillment rails.
+## One-Line Thesis
 
-## Core resources
+Membra API turns owners, surfaces, campaigns, kits, scans, proof records, and reward states into one coherent physical media network.
+
+## Product Role
+
+`Membra_ads` currently contains the first working API scaffold.
+
+This repo should become the canonical shared backend contract once the suite is consolidated.
+
+## Core Resources
 
 - owners
 - advertisers
@@ -32,17 +37,10 @@ Membra API is the source-of-truth backend that turns owners, surfaces, campaigns
 - payment states
 - reward states
 - audit events
+- claims and disputes
+- vendor orders
 
-## Non-negotiable API rules
-
-1. Membra is the control plane.
-2. Frontends do not call vendor APIs directly.
-3. QR and NFC destinations route through Membra first.
-4. Reward release depends on approved proof and payment state.
-5. Every state change should be audit logged.
-6. Sensitive information must not be exposed in public responses.
-
-## MVP endpoints
+## MVP Endpoints
 
 ```text
 GET  /v1/health
@@ -52,12 +50,41 @@ POST /v1/ad-assets
 POST /v1/campaigns
 POST /v1/media-kits
 POST /v1/proof-events
+POST /v1/proof-events/{proof_id}/review
 GET  /v1/campaigns
 GET  /v1/proof-reports/{campaign_id}
 GET  /r/{qr_id}
 GET  /n/{nfc_id}
 ```
 
-## Current stage
+## Integration Points
 
-Backend control-plane scaffold. Next step is to connect it to the existing `Membra_ads` API starter and make this the canonical shared backend.
+| Repo | API Relationship |
+|---|---|
+| `overandor/Membra_ads` | first backend implementation and commercial workflow |
+| `overandor/membra-qr-gateway` | dashboard consumer |
+| `overandor/Membra_mobile` | owner proof and campaign-offer consumer |
+| `overandor/Membra_admin-` | operator console consumer |
+| `overandor/Membra_proofbook` | proof/audit verification sink |
+| `overandor/Membra_wallet` | funding, reward, payout state boundary |
+| `overandor/Membra_vendor_adapters` | vendor fulfillment action layer |
+| `overandor/Membra_kpi` | reporting and export consumer |
+
+## Non-Negotiable API Rules
+
+1. MEMBRA is the control plane.
+2. Frontends do not call vendor APIs directly.
+3. QR and NFC destinations route through MEMBRA first.
+4. Reward release depends on approved proof and payment state.
+5. Every state change should be audit logged.
+6. Sensitive information must not be exposed in public responses.
+7. Demo data must be labeled as demo data.
+8. No payout mutation should occur without authorization and audit trail.
+
+## Productization Priority
+
+This repo should be implemented after `Membra_ads` stabilizes. The cleanest path is to migrate or mirror the working `Membra_ads` FastAPI API into this repo as the canonical backend.
+
+## Current Stage
+
+Backend control-plane namespace and API charter. Not yet the canonical implementation.

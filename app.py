@@ -1,8 +1,7 @@
 """MEMBRA API — canonical gateway for the proof-of-reality network.
 
-This service normalizes the shared objects used by the MEMBRA repos:
-users, assets, listings, campaigns, relay jobs, proof events, wallet ledger
-entries, and payout eligibility records.
+This service normalizes shared objects used by MEMBRA repos and now ingests
+canonical MEMBRA OS event envelopes from producer modules such as Membra_kpi.
 
 It is intentionally settlement-safe: it records eligibility and audit state,
 but it does not move money by itself.
@@ -11,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -23,8 +23,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 APP_NAME = "MEMBRA API Gateway"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/tmp/membra_api.sqlite3"))
+MEMBRA_EVENT_SECRET = os.getenv("MEMBRA_EVENT_SECRET", "")
 api = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 
@@ -43,8 +44,22 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def canonical(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
 def digest(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
+
+
+def verify_event_signature(event: dict[str, Any]) -> bool:
+    if not MEMBRA_EVENT_SECRET:
+        return True
+    supplied = event.get("signature") or ""
+    unsigned = dict(event)
+    unsigned["signature"] = None
+    expected = "hmac_sha256:" + hmac.new(MEMBRA_EVENT_SECRET.encode("utf-8"), canonical(unsigned).encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(supplied, expected)
 
 
 def init_db() -> None:
@@ -58,7 +73,28 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS proof_events(proof_id TEXT PRIMARY KEY,subject_type TEXT,subject_id TEXT,proof_type TEXT,evidence_url TEXT,metadata_json TEXT,proof_hash TEXT,status TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS wallet_events(ledger_event_id TEXT PRIMARY KEY,user_id TEXT,subject_type TEXT,subject_id TEXT,amount_usd REAL,event_type TEXT,status TEXT,metadata_json TEXT,created_at TEXT);
         CREATE TABLE IF NOT EXISTS payout_eligibility(payout_event_id TEXT PRIMARY KEY,user_id TEXT,subject_type TEXT,subject_id TEXT,eligible_amount_usd REAL,eligibility_reason TEXT,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS events(
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT,
+          source_module TEXT,
+          subject_type TEXT,
+          subject_id TEXT,
+          owner_id TEXT,
+          correlation_id TEXT,
+          causation_id TEXT,
+          risk_level TEXT,
+          proof_hash TEXT,
+          signature TEXT,
+          payload_json TEXT,
+          status TEXT,
+          created_at TEXT,
+          ingested_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_subject ON events(subject_type, subject_id);
+        CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_events_owner ON events(owner_id);
         """)
+
 
 init_db()
 
@@ -115,9 +151,94 @@ class WalletEventIn(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MembraEventIn(BaseModel):
+    event_id: str
+    event_type: str
+    source_module: str
+    subject_type: str
+    subject_id: str
+    owner_id: str | None = None
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    created_at: str
+    consent_scope: str | None = None
+    risk_level: str = "normal"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    proof_hash: str | None = None
+    signature: str | None = None
+
+
+def project_event(event: MembraEventIn) -> list[dict[str, Any]]:
+    """Project selected canonical events into API tables.
+
+    Projection is intentionally conservative and idempotent-ish. Raw event payloads
+    remain the source of truth in the events table.
+    """
+    actions: list[dict[str, Any]] = []
+    payload = event.payload or {}
+    with db() as conn:
+        if event.event_type == "photo_analyzed":
+            proof_id = new_id("proof")
+            proof_hash = event.proof_hash or digest(event.model_dump())
+            conn.execute(
+                "INSERT OR IGNORE INTO proof_events VALUES(?,?,?,?,?,?,?,?,?)",
+                (proof_id, event.subject_type, event.subject_id, "photo_analyzed_event", "", json.dumps(payload, default=str), proof_hash, "event_ingested_pending_review", now()),
+            )
+            actions.append({"table": "proof_events", "id": proof_id})
+        elif event.event_type == "visibility_confirmed":
+            listing_id = event.subject_id
+            price = float(payload.get("eligible_amount_usd") or payload.get("price_usd") or 0)
+            conn.execute(
+                "INSERT OR IGNORE INTO wallet_events VALUES(?,?,?,?,?,?,?,?,?)",
+                (new_id("ledger"), event.owner_id or "owner_unknown", "listing", listing_id, price, "visibility_confirmed", "recorded_not_settled", json.dumps(payload, default=str), now()),
+            )
+            actions.append({"table": "wallet_events", "id": listing_id})
+        elif event.event_type == "payout_eligibility_created":
+            payout_id = new_id("payout")
+            amount = float(payload.get("eligible_amount_usd") or 0)
+            conn.execute(
+                "INSERT OR IGNORE INTO payout_eligibility VALUES(?,?,?,?,?,?,?,?)",
+                (payout_id, event.owner_id or "owner_unknown", event.subject_type, event.subject_id, amount, "event_ingested", "eligible_pending_external_settlement", now()),
+            )
+            actions.append({"table": "payout_eligibility", "id": payout_id})
+    return actions
+
+
 @api.get("/api/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "app": APP_NAME, "version": APP_VERSION, "doctrine": "proof records eligibility; external rails settle money"}
+
+
+@api.get("/api/ready")
+def ready() -> dict[str, Any]:
+    with db() as conn:
+        event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    warnings = [] if MEMBRA_EVENT_SECRET else ["MEMBRA_EVENT_SECRET not configured; signed event verification is permissive"]
+    return {"ok": True, "event_count": event_count, "warnings": warnings}
+
+
+@api.post("/api/events/ingest")
+def ingest_event(data: MembraEventIn) -> dict[str, Any]:
+    event = data.model_dump()
+    if not verify_event_signature(event):
+        raise HTTPException(401, "invalid event signature")
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO events(event_id,event_type,source_module,subject_type,subject_id,owner_id,correlation_id,causation_id,risk_level,proof_hash,signature,payload_json,status,created_at,ingested_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (data.event_id, data.event_type, data.source_module, data.subject_type, data.subject_id, data.owner_id, data.correlation_id, data.causation_id, data.risk_level, data.proof_hash, data.signature, json.dumps(event, default=str), "ingested", data.created_at, now()),
+        )
+    projections = project_event(data)
+    return {"ok": True, "event_id": data.event_id, "projections": projections}
+
+
+@api.get("/api/events")
+def list_events() -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM events ORDER BY ingested_at DESC LIMIT 500").fetchall()
+    return {"events": [dict(row) for row in rows]}
 
 
 @api.post("/api/users")
@@ -200,11 +321,12 @@ def create_payout_eligibility(proof_id: str, user_id: str, amount_usd: float = 0
 
 @api.get("/api/{table}")
 def list_table(table: str) -> dict[str, Any]:
-    allowed = {"users", "assets", "listings", "campaigns", "relay_jobs", "proof_events", "wallet_events", "payout_eligibility"}
+    allowed = {"users", "assets", "listings", "campaigns", "relay_jobs", "proof_events", "wallet_events", "payout_eligibility", "events"}
     if table not in allowed:
         raise HTTPException(404, "unknown table")
+    order_col = "ingested_at" if table == "events" else "created_at"
     with db() as conn:
-        rows = conn.execute(f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT 250").fetchall()
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_col} DESC LIMIT 250").fetchall()
     return {table: [dict(r) for r in rows]}
 
 
